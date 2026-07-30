@@ -236,6 +236,103 @@ def entrenar_lstm(modelo, X, y, epocas: int = 300, lote: int = 16,
     return historia
 
 
+def ajustar_lstm(valores_train_log: np.ndarray, cfg: dict,
+                 semilla: int = config.SEMILLA, verbose: int = 0) -> dict:
+    """
+    Entrena una LSTM con la configuracion `cfg` sobre la serie en log.
+
+    Concentra las dos formas de presentarle los datos a la red, que es el eje
+    `presentacion` de la grilla:
+
+      "nivel"        -> la red recibe log(viajeros) y predice el siguiente log.
+      "diferenciada" -> la red recibe los cambios mes a mes del log y predice el
+                        siguiente cambio. El nivel se reconstruye despues con una
+                        suma acumulada a partir del ultimo valor real conocido
+                        (el ancla), ya que diferenciar y acumular son operaciones
+                        inversas.
+
+    Devuelve un diccionario con todo lo necesario para pronosticar despues, de
+    modo que el tuneo y el ajuste del modelo final usan exactamente el mismo
+    camino y no puede haber diferencias accidentales entre ambos.
+    """
+    from tensorflow import keras
+
+    ventana = cfg["ventana"]
+    diferenciada = cfg.get("presentacion", "nivel") == "diferenciada"
+
+    if diferenciada:
+        base = np.diff(valores_train_log)      # cambios mes a mes del log
+        ancla = float(valores_train_log[-1])   # ultimo nivel real conocido
+    else:
+        base = np.asarray(valores_train_log, dtype="float64")
+        ancla = None
+
+    escalador = EscaladorMinMax().ajustar(base)
+    base_esc = escalador.transformar(base)
+    X, y = a_supervisado(base_esc, ventana)
+
+    keras.backend.clear_session()
+    fijar_semillas(semilla)
+    modelo = construir_lstm(
+        ventana=ventana, unidades=cfg["unidades"], capas=cfg["capas"],
+        dropout=cfg["dropout"], tasa_aprendizaje=cfg["tasa_aprendizaje"],
+        bidireccional=cfg.get("bidireccional", False),
+    )
+    historia = entrenar_lstm(modelo, X, y, epocas=cfg.get("epocas", 300),
+                             lote=cfg.get("lote", 16),
+                             paciencia=cfg.get("paciencia", 40), verbose=verbose)
+
+    return {
+        "cfg": cfg, "modelo": modelo, "escalador": escalador, "base_esc": base_esc,
+        "ancla": ancla, "diferenciada": diferenciada, "ventana": ventana,
+        "historia": historia, "n_muestras": len(X),
+        "epocas_corridas": len(historia.history["loss"]),
+    }
+
+
+def pronosticar_log(ajuste: dict, pasos: int) -> np.ndarray:
+    """
+    Pronostico recursivo de `pasos` meses, devuelto siempre en log(viajeros).
+
+    Si la red se entreno sobre la serie diferenciada, lo que predice son cambios,
+    asi que se acumulan sobre el ancla para volver al nivel. De esta forma quien
+    llama a la funcion recibe siempre lo mismo (niveles en log) sin importar como
+    se le presentaron los datos a la red, y las metricas se calculan igual en
+    ambos casos.
+    """
+    pred_esc = pronostico_recursivo(ajuste["modelo"], ajuste["base_esc"],
+                                    ajuste["ventana"], pasos)
+    pred = ajuste["escalador"].invertir(pred_esc)
+    if ajuste["diferenciada"]:
+        return ajuste["ancla"] + np.cumsum(pred)
+    return pred
+
+
+def pronosticar_log_un_paso(ajuste: dict, serie_completa_log: np.ndarray,
+                            pasos: int) -> np.ndarray:
+    """
+    Pronostico a un paso con ventana deslizante, devuelto en log(viajeros).
+
+    A diferencia de pronosticar_log, aqui la red si ve el valor real de los meses
+    previos del periodo de prueba (nunca el que esta prediciendo). Es una tarea
+    mas facil y NO es comparable con las metricas del Lab 1; se reporta aparte
+    para poder separar dos cosas distintas: que la red no logre aprender el
+    patron, o que si lo aprenda pero no aguante extrapolar 63 meses seguidos.
+    """
+    serie_completa_log = np.asarray(serie_completa_log, dtype="float64")
+    if ajuste["diferenciada"]:
+        base = np.diff(serie_completa_log)
+        niveles_previos = serie_completa_log[-pasos - 1:-1]   # ancla de cada mes
+    else:
+        base = serie_completa_log
+        niveles_previos = None
+
+    base_esc = ajuste["escalador"].transformar(base)
+    pred_esc = pronostico_un_paso(ajuste["modelo"], base_esc, ajuste["ventana"], pasos)
+    pred = ajuste["escalador"].invertir(pred_esc)
+    return niveles_previos + pred if ajuste["diferenciada"] else pred
+
+
 def pronostico_recursivo(modelo, historia_escalada: np.ndarray,
                          ventana: int, pasos: int) -> np.ndarray:
     """
@@ -319,34 +416,17 @@ def evaluar_config(valores_train_log: np.ndarray, cfg: dict,
     permite verificar si la configuracion ganadora lo es de verdad o solo por
     como se comporto en ese tramo irrepetible.
     """
-    from tensorflow import keras
-
-    ventana = cfg["ventana"]
     rmses, maes = [], []
 
     for fin_train, fin_val in cortes_origen_rodante(len(valores_train_log), n_cortes, tamano_val):
         tramo_train = valores_train_log[:fin_train]
         tramo_val = valores_train_log[fin_train:fin_val]
 
-        escalador = EscaladorMinMax().ajustar(tramo_train)
-        train_esc = escalador.transformar(tramo_train)
-
-        X, y = a_supervisado(train_esc, ventana)
-        if len(X) < 20:
+        ajuste = ajustar_lstm(tramo_train, cfg, semilla)
+        if ajuste["n_muestras"] < 20:
             continue
 
-        keras.backend.clear_session()
-        fijar_semillas(semilla)
-        modelo = construir_lstm(
-            ventana=ventana, unidades=cfg["unidades"], capas=cfg["capas"],
-            dropout=cfg["dropout"], tasa_aprendizaje=cfg["tasa_aprendizaje"],
-            bidireccional=cfg.get("bidireccional", False),
-        )
-        entrenar_lstm(modelo, X, y, epocas=cfg.get("epocas", 300),
-                      lote=cfg.get("lote", 16), paciencia=cfg.get("paciencia", 40))
-
-        pred_esc = pronostico_recursivo(modelo, train_esc, ventana, len(tramo_val))
-        pred_log = escalador.invertir(pred_esc)
+        pred_log = pronosticar_log(ajuste, len(tramo_val))
 
         m = metricas(tramo_val, pred_log)
         rmses.append(m["RMSE"])
@@ -366,37 +446,53 @@ def evaluar_config(valores_train_log: np.ndarray, cfg: dict,
     }
 
 
+# Tasa de aprendizaje con la que se recorre el grid. No es un eje de busqueda
+# porque es justamente el parametro que distingue al Modelo 1 del Modelo 2: el
+# grid encuentra la mejor configuracion con este valor fijo y despues los dos
+# modelos finales se instancian con esa configuracion y solo cambian la tasa.
+LR_GRID = 0.001
+LR_MODELOS = {"Modelo 1": 0.001, "Modelo 2": 0.01}
+
+
 def grilla_lstm() -> list[dict]:
     """
-    Grilla de tuneo, organizada en tres familias de arquitectura.
+    Grilla de tuneo: 24 configuraciones sobre tres ejes.
 
-    Las familias son las "configuraciones diferentes" que pide el inciso 1.2, y
-    dentro de cada una se varian los hiperparametros que mas pesan con series
-    cortas: el tamano de la ventana (12 = un ciclo anual, 24 = dos ciclos), el
-    numero de unidades y la tasa de aprendizaje.
+    presentacion (2) — "nivel": la red recibe log(viajeros) y predice el nivel.
+                       "diferenciada": recibe los cambios mes a mes y predice el
+                       siguiente cambio, y el nivel se reconstruye acumulando.
+                       Es el eje que mas puede pesar, porque no cambia que tan
+                       bien la red resuelve el problema sino CUAL es el problema.
 
-      A. LSTM simple       — 1 capa, sin dropout. La linea base.
-      B. LSTM apilada      — 2 capas + dropout 0.2. Mas capacidad, mas riesgo de
-                             sobreajuste con 147 observaciones; el dropout esta
-                             justamente para contenerlo.
-      C. LSTM bidireccional— recorre la ventana en ambos sentidos. En pronostico
-                             puro es discutible (el futuro no se lee al reves),
-                             pero dentro de una ventana cerrada de 12-24 meses si
-                             puede ayudar a caracterizar mejor el ciclo, y por eso
-                             se incluye como tercera familia a contrastar.
+    ventana (2)      — 12 meses (un ciclo anual completo) o 24 (dos ciclos, para
+                       que pueda comparar un ano contra el anterior). Por debajo
+                       de 12 la red no alcanza a ver el ciclo y no podria
+                       aprender la estacionalidad ni queriendo.
+
+    arquitectura (6) — tres familias, que son las "configuraciones diferentes"
+                       del enunciado:
+                       A. simple       — 1 capa (16/32/64 unidades). La base.
+                       B. apilada      — 2 capas + dropout 0.2 (32/64 unidades).
+                          Mas capacidad, pero con 147 observaciones el riesgo de
+                          sobreajuste es real y el dropout esta para contenerlo.
+                       C. bidireccional— 32 unidades, recorre la ventana en los
+                          dos sentidos. En pronostico es discutible, pero dentro
+                          de una ventana cerrada puede caracterizar mejor el
+                          ciclo, y por eso vale contrastarla.
     """
     grilla = []
-    for ventana in (12, 24):
-        for lr in (0.01, 0.001):
+    for presentacion in ("nivel", "diferenciada"):
+        for ventana in (12, 24):
+            comun = dict(presentacion=presentacion, ventana=ventana,
+                         tasa_aprendizaje=LR_GRID)
             for unidades in (16, 32, 64):
-                grilla.append(dict(familia="A_simple", ventana=ventana, unidades=unidades,
-                                   capas=1, dropout=0.0, tasa_aprendizaje=lr))
+                grilla.append(dict(familia="A_simple", unidades=unidades,
+                                   capas=1, dropout=0.0, **comun))
             for unidades in (32, 64):
-                grilla.append(dict(familia="B_apilada", ventana=ventana, unidades=unidades,
-                                   capas=2, dropout=0.2, tasa_aprendizaje=lr))
-            grilla.append(dict(familia="C_bidireccional", ventana=ventana, unidades=32,
-                               capas=1, dropout=0.0, tasa_aprendizaje=lr,
-                               bidireccional=True))
+                grilla.append(dict(familia="B_apilada", unidades=unidades,
+                                   capas=2, dropout=0.2, **comun))
+            grilla.append(dict(familia="C_bidireccional", unidades=32,
+                               capas=1, dropout=0.0, bidireccional=True, **comun))
     return grilla
 
 
@@ -409,9 +505,9 @@ def tunear(valores_train_log: np.ndarray, grilla: list[dict],
         res = evaluar_config(valores_train_log, cfg, n_cortes, tamano_val, semilla)
         filas.append({**cfg, **res})
         if verbose:
-            print(f"[{i:3d}/{len(grilla)}] {cfg.get('familia','')} v={cfg['ventana']} "
-                  f"u={cfg['unidades']} lr={cfg['tasa_aprendizaje']}  ->  "
-                  f"RMSE_val={res['RMSE_val']:,.0f}")
+            print(f"[{i:3d}/{len(grilla)}] {cfg.get('presentacion','nivel'):13s} "
+                  f"{cfg.get('familia',''):16s} v={cfg['ventana']:2d} "
+                  f"u={cfg['unidades']:2d}  ->  RMSE_val={res['RMSE_val']:>12,.0f}")
     return pd.DataFrame(filas).sort_values("RMSE_val").reset_index(drop=True)
 
 

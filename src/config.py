@@ -32,7 +32,7 @@ RUTA_CRUDA = DIR_RAW / "Base_Migracion_2009-2026jun.xlsx"
 # Constantes del dominio
 # --------------------------------------------------------------------------- #
 PERIODO = 12          # estacionalidad mensual
-SEMILLA = 42          # reproducibilidad
+SEMILLA = 123         # reproducibilidad
 COL_VALOR = "Viajero"
 COL_FECHA = "Fecha"
 
