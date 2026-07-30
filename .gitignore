@@ -1,0 +1,22 @@
+# Entorno virtual: se regenera con `uv venv` + requirements.txt, no se versiona.
+.venv/
+venv/
+env/
+
+# Cache de python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Resultados regenerables por el codigo (tablas de tuneo, figuras, pesos).
+# Se dejan fuera del repo porque se pueden reproducir corriendo los notebooks.
+resultados/tablas/
+resultados/figuras/
+resultados/modelos/
+
+# Sistema / editores
+.DS_Store
+.vscode/
+.idea/
+*.log
+.env*
