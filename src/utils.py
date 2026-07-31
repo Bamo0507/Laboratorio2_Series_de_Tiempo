@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import random
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -106,6 +107,49 @@ def metricas(y_true_log, y_pred_log) -> dict:
     rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     mape = float(np.mean(np.abs((y_true - y_pred) / y_true)) * 100)
     return {"MAE": mae, "RMSE": rmse, "MAPE_%": mape}
+
+
+def metricas_lab1(clave_serie: str) -> dict:
+    """
+    Reproduce el pronostico del mejor modelo del Laboratorio 1 y devuelve sus
+    metricas, incluido el MAPE.
+
+    Existe por una razon concreta: en el Lab 1 solo se reportaron MAE y RMSE, de
+    tal forma que al comparar contra la LSTM la columna de MAPE quedaria vacia y
+    la tabla del inciso 1.4 tendria un hueco. Al reajustar el modelo ganador sobre
+    el mismo entrenamiento se puede calcular la metrica que falta sin inventarla.
+
+    Solo aplica cuando ese modelo ganador fue el suavizamiento exponencial simple;
+    para las demas series (por ejemplo Valle Nuevo, donde gano Prophet) devuelve
+    el MAPE en None en lugar de asumir un modelo que no corresponde.
+
+    Adicional, valida que el MAE y el RMSE reproducidos coincidan con los que se
+    guardaron en config. Asi, si en algun momento cambiara la construccion de las
+    series, esto falla de forma visible en vez de devolver en silencio un numero
+    distinto al que se reporto en el laboratorio anterior.
+    """
+    from statsmodels.tsa.holtwinters import SimpleExpSmoothing
+
+    referencia = config.MEJORES_LAB1[clave_serie]
+    resultado = {"modelo": referencia["modelo"], "MAE": referencia["MAE"],
+                 "RMSE": referencia["RMSE"], "MAPE_%": None, "reproducido": False}
+
+    if referencia["modelo"] != "Suav. exp. simple":
+        return resultado
+
+    train_log = np.log(construir_serie(clave_serie, "train"))
+    prueba_log = np.log(construir_serie(clave_serie, "prueba"))
+    ses = SimpleExpSmoothing(train_log).fit()
+    pred_log = ses.forecast(len(prueba_log))
+    m = metricas(prueba_log.values, pred_log.values)
+
+    afirmar(abs(m["MAE"] - referencia["MAE"]) < 1 and abs(m["RMSE"] - referencia["RMSE"]) < 1,
+            f"el modelo del Lab 1 se reproduce exacto para {clave_serie} "
+            f"(MAE {m['MAE']:,.0f} vs {referencia['MAE']:,.0f})")
+
+    resultado.update({"MAPE_%": m["MAPE_%"], "reproducido": True,
+                      "pred_log": pred_log})
+    return resultado
 
 
 # --------------------------------------------------------------------------- #
@@ -344,12 +388,17 @@ def pronostico_recursivo(modelo, historia_escalada: np.ndarray,
     `ventana` meses del entrenamiento y cada prediccion se vuelve entrada de la
     siguiente, de modo que a partir del paso `ventana+1` la red esta prediciendo
     sobre puro pronostico propio.
+
+    Se llama al modelo directo (`modelo(x)`) en vez de `modelo.predict(x)`, ya
+    que predict() carga un sobrecosto fijo por llamada que aqui se pagaria una
+    vez por cada mes pronosticado; medido, es 2.3x mas lento para una sola
+    muestra.
     """
     ventana_actual = list(np.asarray(historia_escalada, dtype="float64")[-ventana:])
     predicciones = []
     for _ in range(pasos):
         entrada = np.asarray(ventana_actual[-ventana:], dtype="float32").reshape(1, ventana, 1)
-        siguiente = float(modelo.predict(entrada, verbose=0)[0, 0])
+        siguiente = float(modelo(entrada, training=False)[0, 0])
         predicciones.append(siguiente)
         ventana_actual.append(siguiente)
     return np.asarray(predicciones)
@@ -370,8 +419,197 @@ def pronostico_un_paso(modelo, serie_escalada_completa: np.ndarray,
     predicciones = []
     for t in range(inicio, len(valores)):
         entrada = valores[t - ventana:t].astype("float32").reshape(1, ventana, 1)
-        predicciones.append(float(modelo.predict(entrada, verbose=0)[0, 0]))
+        predicciones.append(float(modelo(entrada, training=False)[0, 0]))
     return np.asarray(predicciones)
+
+
+# --------------------------------------------------------------------------- #
+# Entrenamiento final y reportes
+# --------------------------------------------------------------------------- #
+# Todo lo que sigue vivia repetido dentro de cada notebook por serie. Al estar
+# aqui, cada notebook se queda con su analisis y sus numeros en lugar de arrastrar
+# el mismo andamiaje copiado, y si algo se corrige se corrige en un solo lugar.
+def cfg_desde_fila(fila, epocas: int = 250, paciencia: int = 30,
+                   lote: int = 16) -> dict:
+    """
+    Convierte una fila de la tabla de tuneo en una configuracion limpia.
+
+    Hace falta porque al pasar por el CSV los enteros vuelven como flotantes y las
+    llaves ausentes como NaN, y Keras necesita tipos exactos.
+    """
+    cfg = fila.to_dict() if hasattr(fila, "to_dict") else dict(fila)
+
+    def entero(clave, defecto):
+        valor = cfg.get(clave, defecto)
+        return int(defecto if valor is None or pd.isna(valor) else valor)
+
+    def flotante(clave, defecto):
+        valor = cfg.get(clave, defecto)
+        return float(defecto if valor is None or pd.isna(valor) else valor)
+
+    limpia = {
+        "familia": cfg.get("familia", ""),
+        "ventana": entero("ventana", 12),
+        "unidades": entero("unidades", 32),
+        "capas": entero("capas", 1),
+        "dropout": flotante("dropout", 0.0),
+        "tasa_aprendizaje": flotante("tasa_aprendizaje", 0.001),
+        "epocas": entero("epocas", epocas),
+        "paciencia": entero("paciencia", paciencia),
+        "lote": entero("lote", lote),
+    }
+    bidi = cfg.get("bidireccional", False)
+    limpia["bidireccional"] = bool(False if bidi is None or pd.isna(bidi) else bidi)
+    presentacion = cfg.get("presentacion", "nivel")
+    limpia["presentacion"] = ("nivel" if presentacion is None or pd.isna(presentacion)
+                              else presentacion)
+    return limpia
+
+
+def entrenar_evaluar_final(cfg: dict, serie_train_log: pd.Series,
+                           serie_prueba_log: pd.Series,
+                           semilla: int = config.SEMILLA) -> dict:
+    """
+    Entrena una configuracion sobre todo el entrenamiento y la evalua en prueba.
+
+    Devuelve las metricas en los DOS modos de pronostico, porque responden
+    preguntas distintas: el recursivo es el comparable contra el Laboratorio 1, y
+    el de un paso permite separar si la red no aprendio el patron o si lo aprendio
+    pero no aguanta extrapolar 63 meses realimentandose.
+    """
+    ventana = cfg["ventana"]
+    train = np.asarray(serie_train_log, dtype=float)
+    prueba = np.asarray(serie_prueba_log, dtype=float)
+
+    escalador = EscaladorMinMax().ajustar(train)
+    train_esc = escalador.transformar(train)
+    prueba_esc = escalador.transformar(prueba)
+
+    X, y = a_supervisado(train_esc, ventana)
+
+    from tensorflow import keras
+    keras.backend.clear_session()
+    fijar_semillas(semilla)
+    modelo = construir_lstm(
+        ventana=ventana, unidades=cfg["unidades"], capas=cfg["capas"],
+        dropout=cfg["dropout"], tasa_aprendizaje=cfg["tasa_aprendizaje"],
+        bidireccional=cfg.get("bidireccional", False),
+    )
+    historia = entrenar_lstm(modelo, X, y, epocas=cfg["epocas"],
+                             lote=cfg["lote"], paciencia=cfg["paciencia"])
+
+    pred_rec = escalador.invertir(
+        pronostico_recursivo(modelo, train_esc, ventana, len(prueba)))
+    pred_paso = escalador.invertir(
+        pronostico_un_paso(modelo, np.concatenate([train_esc, prueba_esc]),
+                           ventana, len(prueba)))
+
+    m_rec = metricas(prueba, pred_rec)
+    m_paso = metricas(prueba, pred_paso)
+
+    indice = getattr(serie_prueba_log, "index", None)
+    predicciones = pd.DataFrame({
+        "real": np.exp(prueba),
+        "pred_recursiva": np.exp(pred_rec),
+        "pred_un_paso": np.exp(pred_paso),
+    }, index=indice)
+
+    resumen = {
+        "familia": cfg.get("familia", ""), "ventana": ventana,
+        "unidades": cfg["unidades"], "capas": cfg["capas"],
+        "dropout": cfg["dropout"], "tasa_aprendizaje": cfg["tasa_aprendizaje"],
+        "epocas_entrenadas": len(historia.history["loss"]),
+        "MAE_recursivo": m_rec["MAE"], "RMSE_recursivo": m_rec["RMSE"],
+        "MAPE_recursivo_%": m_rec["MAPE_%"],
+        "MAE_un_paso": m_paso["MAE"], "RMSE_un_paso": m_paso["RMSE"],
+        "MAPE_un_paso_%": m_paso["MAPE_%"],
+    }
+    return {"modelo": modelo, "historia": historia, "escalador": escalador,
+            "train_esc": train_esc, "predicciones": predicciones, "resumen": resumen}
+
+
+def pronostico_extendido(ajuste_final: dict, ventana: int,
+                         desde: str = "2021-04-01",
+                         hasta: str = "2027-12-01") -> pd.Series:
+    """
+    Extiende el pronostico recursivo mas alla del conjunto de prueba.
+
+    Se usa en el inciso 1.3 para proyectar hasta 2027 con el mismo criterio del
+    Laboratorio 1. Cabe notar que el tramo posterior a junio de 2026 es pronostico
+    puro, ya que ahi no hay dato real contra el cual medirlo.
+    """
+    indice = pd.date_range(desde, hasta, freq="MS")
+    pred_esc = pronostico_recursivo(ajuste_final["modelo"],
+                                    ajuste_final["train_esc"], ventana, len(indice))
+    return pd.Series(np.exp(ajuste_final["escalador"].invertir(pred_esc)), index=indice)
+
+
+def reporte_mejor_vs_segundo(tabla_modelos: pd.DataFrame) -> pd.Series:
+    """
+    Imprime el mejor modelo por RMSE recursivo y sus diferencias contra el segundo,
+    y devuelve la fila del mejor. Incluye el cociente entre el error recursivo y el
+    de un paso, que es lo que distingue no aprender el patron de no poder
+    extrapolarlo.
+    """
+    tabla = tabla_modelos.sort_values("RMSE_recursivo").reset_index(drop=True)
+    mejor, segundo = tabla.iloc[0], tabla.iloc[1]
+
+    dif_rmse = segundo["RMSE_recursivo"] - mejor["RMSE_recursivo"]
+    dif_mape = segundo["MAPE_recursivo_%"] - mejor["MAPE_recursivo_%"]
+
+    banner(f"MEJOR MODELO LSTM: familia {mejor['familia']}")
+    print(f"Configuracion  : ventana={int(mejor['ventana'])}, "
+          f"unidades={int(mejor['unidades'])}, capas={int(mejor['capas'])}, "
+          f"dropout={mejor['dropout']:.1f}, lr={mejor['tasa_aprendizaje']:.4f}")
+    print(f"Epocas         : {int(mejor['epocas_entrenadas'])}")
+    print(f"Recursivo      : RMSE {mejor['RMSE_recursivo']:,.0f}  "
+          f"MAE {mejor['MAE_recursivo']:,.0f}  MAPE {mejor['MAPE_recursivo_%']:.1f}%")
+    print(f"A un paso      : RMSE {mejor['RMSE_un_paso']:,.0f}  "
+          f"MAE {mejor['MAE_un_paso']:,.0f}  MAPE {mejor['MAPE_un_paso_%']:.1f}%")
+    print()
+    print(f"Frente al segundo (familia {segundo['familia']}, "
+          f"lr={segundo['tasa_aprendizaje']:.4f}):")
+    print(f"  RMSE : {mejor['RMSE_recursivo']:,.0f} vs {segundo['RMSE_recursivo']:,.0f}"
+          f"  -> {dif_rmse:,.0f} menos ({dif_rmse / segundo['RMSE_recursivo'] * 100:.1f}% mejor)")
+    print(f"  MAPE : {mejor['MAPE_recursivo_%']:.1f}% vs {segundo['MAPE_recursivo_%']:.1f}%"
+          f"  -> {dif_mape:.1f} puntos porcentuales menos")
+    print()
+    print("Recursivo contra un paso (veces que crece el error al extrapolar):")
+    for _, fila in tabla.iterrows():
+        print(f"  {fila['familia']:20s} {fila['RMSE_recursivo'] / fila['RMSE_un_paso']:5.1f}x")
+    return mejor
+
+
+def reporte_comparacion_lab1(clave_serie: str, mejor: pd.Series) -> pd.DataFrame:
+    """
+    Compara el mejor modelo LSTM contra el mejor del Laboratorio 1 y devuelve la
+    tabla. El MAPE del Lab 1 se recalcula con metricas_lab1(), ya que en aquel
+    laboratorio no se reporto y la tabla quedaria con un hueco.
+    """
+    lab1 = metricas_lab1(clave_serie)
+    tabla = pd.DataFrame([
+        {"modelo": f"LSTM {mejor['familia']}", "MAE": mejor["MAE_recursivo"],
+         "RMSE": mejor["RMSE_recursivo"], "MAPE_%": mejor["MAPE_recursivo_%"],
+         "origen": "Laboratorio 2"},
+        {"modelo": lab1["modelo"], "MAE": lab1["MAE"], "RMSE": lab1["RMSE"],
+         "MAPE_%": lab1["MAPE_%"], "origen": "Laboratorio 1"},
+    ]).sort_values("RMSE").reset_index(drop=True)
+
+    dif_mae = mejor["MAE_recursivo"] - lab1["MAE"]
+    dif_rmse = mejor["RMSE_recursivo"] - lab1["RMSE"]
+
+    banner(f"1.4. {config.SERIES_LAB1[clave_serie]['etiqueta']}")
+    print(f"Laboratorio 2 : LSTM {mejor['familia']}  "
+          f"MAE={mejor['MAE_recursivo']:,.0f}  RMSE={mejor['RMSE_recursivo']:,.0f}  "
+          f"MAPE={mejor['MAPE_recursivo_%']:.1f}%")
+    print(f"Laboratorio 1 : {lab1['modelo']}  MAE={lab1['MAE']:,.0f}  "
+          f"RMSE={lab1['RMSE']:,.0f}  "
+          + (f"MAPE={lab1['MAPE_%']:.1f}%" if lab1["MAPE_%"] is not None else "MAPE=n/d"))
+    print(f"Diferencia    : {dif_mae:+,.0f} en MAE ({dif_mae / lab1['MAE'] * 100:+.1f}%)  |  "
+          f"{dif_rmse:+,.0f} en RMSE ({dif_rmse / lab1['RMSE'] * 100:+.1f}%)")
+    print(f"Veredicto     : la LSTM {'SI' if dif_rmse < 0 else 'NO'} supero al mejor "
+          f"modelo del Laboratorio 1 en esta serie.")
+    return tabla
 
 
 # --------------------------------------------------------------------------- #
@@ -496,18 +734,101 @@ def grilla_lstm() -> list[dict]:
     return grilla
 
 
-def tunear(valores_train_log: np.ndarray, grilla: list[dict],
+# Columnas que identifican una configuracion de forma unica. Sirven para saber
+# cuales ya se corrieron y poder retomar el tuneo sin repetirlas.
+CLAVES_CFG = ["presentacion", "familia", "ventana", "unidades", "capas",
+              "dropout", "tasa_aprendizaje"]
+
+
+def _firma(cfg: dict) -> tuple:
+    """Identificador de una configuracion, para comparar contra lo ya corrido."""
+    return tuple(str(cfg.get(k, "")) for k in CLAVES_CFG)
+
+
+def _reloj(segundos: float) -> str:
+    minutos, seg = divmod(int(segundos), 60)
+    return f"{minutos:d}m{seg:02d}s"
+
+
+def tunear(clave_serie: str, valores_train_log: np.ndarray,
+           grilla: list[dict] | None = None, reiniciar: bool = False,
            n_cortes: int = 4, tamano_val: int = 12,
            semilla: int = config.SEMILLA, verbose: bool = True) -> pd.DataFrame:
-    """Recorre la grilla completa y devuelve la tabla ordenada por RMSE de validacion."""
-    filas = []
-    for i, cfg in enumerate(grilla, 1):
+    """
+    Recorre la grilla con validacion de origen rodante y devuelve la tabla
+    ordenada por RMSE de validacion.
+
+    Esta pensada para corrersela desde una celda del notebook, asi que se toman
+    tres precauciones que importan cuando algo tarda varios minutos ahi:
+
+      1. Progreso con `flush=True`. Sin eso Jupyter puede retener los prints en
+         el buffer y no mostrar nada hasta que la celda termina, de tal forma que
+         una corrida que si esta avanzando parece colgada. Cada linea muestra
+         ademas el tiempo de la configuracion y el estimado de lo que resta.
+
+      2. Guardado incremental. El CSV se reescribe despues de CADA configuracion,
+         de modo que si se interrumpe la celda o se reinicia el kernel no se
+         pierde lo ya corrido.
+
+      3. Reanudacion. Al volver a ejecutarla lee el CSV, identifica que
+         configuraciones ya estan y solo corre las que faltan. Con
+         reiniciar=True se ignora lo previo y se arranca de cero.
+
+    En ningun momento se usa el conjunto de prueba.
+
+    Nota de compatibilidad: la grilla puede traer o no la llave `presentacion`.
+    Si no la trae se asume "nivel", de modo que una grilla armada a mano con solo
+    arquitectura e hiperparametros sigue funcionando sin cambios.
+    """
+    grilla = grilla or grilla_lstm()
+    ruta = config.DIR_TABLAS / f"tuneo_lstm_{clave_serie}.csv"
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    cortes = cortes_origen_rodante(len(valores_train_log), n_cortes, tamano_val)
+
+    def log(mensaje: str) -> None:
+        if verbose:
+            print(mensaje, flush=True)
+
+    log(f"Configuraciones     : {len(grilla)}")
+    log(f"Cortes de validacion: {cortes}")
+    log(f"Entrenamientos      : {len(grilla) * len(cortes)}")
+    log(f"Semilla             : {semilla}")
+
+    filas, hechas = [], set()
+    if ruta.exists() and not reiniciar:
+        filas = pd.read_csv(ruta).to_dict("records")
+        hechas = {_firma(f) for f in filas}
+        log(f"[cargado] {ruta.name}: {len(hechas)} ya corridas, se retoman")
+
+    pendientes = [cfg for cfg in grilla if _firma(cfg) not in hechas]
+    if not pendientes:
+        log("[ok] el tuneo ya estaba completo")
+        return pd.DataFrame(filas).sort_values("RMSE_val").reset_index(drop=True)
+
+    log(f"\nPendientes: {len(pendientes)} de {len(grilla)}\n")
+    log(f"{'#':>3} {'presentacion':13s} {'familia':18s} {'v':>3} {'u':>3} "
+        f"{'RMSE_val':>12} {'sin pand.':>12} {'esta':>7} {'resta':>7}")
+    log("-" * 94)
+
+    t_inicio = time.time()
+    for i, cfg in enumerate(pendientes, 1):
+        t_cfg = time.time()
         res = evaluar_config(valores_train_log, cfg, n_cortes, tamano_val, semilla)
         filas.append({**cfg, **res})
-        if verbose:
-            print(f"[{i:3d}/{len(grilla)}] {cfg.get('presentacion','nivel'):13s} "
-                  f"{cfg.get('familia',''):16s} v={cfg['ventana']:2d} "
-                  f"u={cfg['unidades']:2d}  ->  RMSE_val={res['RMSE_val']:>12,.0f}")
+        pd.DataFrame(filas).to_csv(ruta, index=False)   # incremental
+
+        transcurrido = time.time() - t_inicio
+        resta = transcurrido / i * (len(pendientes) - i)
+        log(f"{i:3d} {cfg.get('presentacion', 'nivel'):13s} "
+            f"{cfg.get('familia', ''):18s} "
+            f"{cfg['ventana']:3d} {cfg['unidades']:3d} "
+            f"{res['RMSE_val']:12,.0f} {res['RMSE_val_sin_ultimo']:12,.0f} "
+            f"{_reloj(time.time() - t_cfg):>7} {_reloj(resta):>7}")
+
+    log("-" * 94)
+    log(f"[guardado] {ruta}")
+    log(f"[ok] tuneo completo en {_reloj(time.time() - t_inicio)}")
+
     return pd.DataFrame(filas).sort_values("RMSE_val").reset_index(drop=True)
 
 
@@ -515,20 +836,13 @@ def tunear_con_cache(clave_serie: str, valores_train_log: np.ndarray,
                      grilla: list[dict] | None = None, usar_cache: bool = True,
                      **kwargs) -> pd.DataFrame:
     """
-    Igual que tunear(), pero guarda el resultado en resultados/tablas/.
+    Envoltura de tunear() que respeta el CSV ya guardado.
 
-    El tuneo cuesta varios minutos, asi que se cachea para que reejecutar el
-    notebook no obligue a repetirlo. Con usar_cache=False se fuerza a correrlo
-    de nuevo desde cero. La grilla y la semilla estan fijas, de modo que el
-    archivo cacheado es reproducible: borrarlo y volver a correr da lo mismo.
+    Con usar_cache=True (lo normal al reejecutar el notebook) carga la tabla si
+    ya esta completa y no vuelve a entrenar nada; si esta a medias, retoma donde
+    quedo. Con usar_cache=False fuerza el tuneo desde cero. La grilla y la
+    semilla estan fijas, de modo que el archivo es reproducible: borrarlo y
+    volver a correr da el mismo resultado.
     """
-    ruta = config.DIR_TABLAS / f"tuneo_lstm_{clave_serie}.csv"
-    if usar_cache and ruta.exists():
-        print(f"[cargado] {ruta.name} (tuneo cacheado; usar_cache=False para repetirlo)")
-        return pd.read_csv(ruta)
-
-    tabla = tunear(valores_train_log, grilla or grilla_lstm(), **kwargs)
-    ruta.parent.mkdir(parents=True, exist_ok=True)
-    tabla.to_csv(ruta, index=False)
-    print(f"[guardado] {ruta}")
-    return tabla
+    return tunear(clave_serie, valores_train_log, grilla,
+                  reiniciar=not usar_cache, **kwargs)
